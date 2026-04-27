@@ -1,0 +1,10 @@
+.venv/
+.env
+cuda.txt
+vllm-0.19.0+cu124-cp312-cp312-win_amd64.whl
+예시/
+__pycache__/
+mysql.txt
+예시.txt
+db_test.py
+
