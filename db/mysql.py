@@ -74,6 +74,7 @@ async def execute(query: str, params: tuple = ()):
             async with (await _get_pool()).acquire() as conn:
                 async with conn.cursor() as cursor:
                     await cursor.execute(query, params)
+                    await conn.commit()
                     return cursor.rowcount
         except aiomysql.OperationalError:
             global pool
@@ -87,10 +88,12 @@ async def get_participants(meeting_id: str):
     query_id = "SELECT user_id FROM meeting_participants WHERE meeting_id = %s"
     rows_id = await fetch_all(query_id, (meeting_id,))
     ids = [int(row["user_id"]) for row in rows_id]
-    query_name = "SELECT name FROM users WHERE id IN %s"
-    rows_name = await fetch_all(query_name, (ids,))
-    names = [row["name"] for row in rows_name]
-    return dict(zip(ids, names))
+    if not ids:
+        return {}
+    s = ",".join(["%s"] * len(ids))
+    query_name = f"SELECT id, name FROM users WHERE id IN ({s})"
+    rows_name = await fetch_all(query_name, tuple(ids))
+    return {int(row["id"]): row["name"] for row in rows_name}
 
 # 회의 참가자 임베딩 조회
 async def get_participants_embeddings(participant_ids: list):
@@ -101,12 +104,41 @@ async def get_participants_embeddings(participant_ids: list):
     query = f"SELECT user_id, voice_embedding FROM speaker_profiles WHERE user_id IN ({s})"
     rows = await fetch_all(query, tuple(participant_ids))
     
-    # DB 반환 순서가 보장되지 않으므로 user_id 기준으로 매핑
-    emb_by_uid = {row["user_id"]: json.loads(row["voice_embedding"]) for row in rows}
-    return [emb_by_uid[uid] for uid in participant_ids if uid in emb_by_uid]
+    # DB 반환 순서가 보장되지 않으므로 user_id 기준으로 매핑하여 dict 반환
+    # voice_embedding이 NULL이거나 빈 값인 경우 스킵
+    emb_by_uid = {}
+    for row in rows:
+        raw = row["voice_embedding"]
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not parsed:  # 빈 리스트 [] 등 스킵
+            continue
+        emb_by_uid[row["user_id"]] = parsed
+    return emb_by_uid
 
 # 회의 정보 조회 (workspace_id 등)
 async def get_meeting_info(meeting_id: str):
     query = "SELECT workspace_id FROM meetings WHERE id = %s"
     return await fetch_one(query, (meeting_id,))
+
+async def save_user_embedding(user_id: int, embedding: str):
+    # 기존 임베딩이 있으면 업데이트, 없으면 삽입
+    query_check = "SELECT COUNT(*) AS count FROM speaker_profiles WHERE user_id = %s"
+    row = await fetch_one(query_check, (user_id,))
+    
+    if row["count"] > 0:
+        query_update = "UPDATE speaker_profiles SET voice_embedding = %s WHERE user_id = %s"
+        await execute(query_update, (embedding, user_id))
+    else:
+        query_insert = (
+            "INSERT INTO speaker_profiles (user_id, voice_embedding, workspace_id, is_verified, created_at, diarization_method, updated_at) "
+            "VALUES (%s, %s, (SELECT workspace_id FROM users WHERE id = %s), 1, NOW(), %s, NOW())"
+        )
+        await execute(query_insert, (user_id, embedding, user_id, 'diarization'))
+    
+
 

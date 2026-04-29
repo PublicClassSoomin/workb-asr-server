@@ -56,7 +56,7 @@ def run_diarization(wav16k: np.ndarray, embedding_speakers) -> tuple[list[dict],
     audio_input = {"waveform": waveform, "sample_rate": 16000}
 
     diarization = pyannote_pipeline(audio_input, return_embeddings=True)
-    print(f"[INFO] 화자분리 완료: \n {diarization}")
+    # print(f"[INFO] 화자분리 완료: \n {diarization}")
 
     diarization_names = diarization.speaker_diarization.labels()
     print(f"[DEBUG] pyannote 감지 화자 수: {len(diarization_names)}, 레이블: {diarization_names}")
@@ -75,7 +75,10 @@ def run_diarization(wav16k: np.ndarray, embedding_speakers) -> tuple[list[dict],
         scores = []
         ids = []
         for id, emb in embedding_speakers.items():
-            score = 1 - cosine(np.array(emb).flatten(), np.array(e).flatten())
+            emb_arr = np.array(emb).flatten()
+            if emb_arr.size == 0:  # 빈 임베딩 스킵
+                continue
+            score = 1 - cosine(emb_arr, np.array(e).flatten())
             scores.append(score)
             ids.append(id)
             print(f"[DEBUG] 화자 {diarization_names[i]} vs {id}: 유사도={score:.4f}")
@@ -234,7 +237,10 @@ def offline_diarization(wav16k: np.ndarray, participants_embeddings) -> list[dic
         scores = []
         names = []
         for id, emb in embedding_speakers.items():
-            score = 1 - cosine(np.array(emb).flatten(), np.array(e).flatten())
+            emb_arr = np.array(emb).flatten()
+            if emb_arr.size == 0:  # 빈 임베딩 스킵
+                continue
+            score = 1 - cosine(emb_arr, np.array(e).flatten())
             scores.append(score)
             names.append(id)
             print(f"[DEBUG] 화자 {diarization_names[i]} vs {id}: 유사도={score:.4f}")
@@ -290,8 +296,8 @@ def offline_asr_chunked(wav16k: np.ndarray, segments: list[dict]) -> list[dict]:
         else:
             merged.append(seg.copy())
 
-    # 너무 짧은 세그먼트 필터 (1.0초 미만)
-    merged = [s for s in merged if s["end"] - s["start"] >= 1.0]
+    # 너무 짧은 세그먼트 필터 (0.3초 미만)
+    merged = [s for s in merged if s["end"] - s["start"] >= 0.3]
     if not merged:
         return []
 
@@ -302,7 +308,7 @@ def offline_asr_chunked(wav16k: np.ndarray, segments: list[dict]) -> list[dict]:
         start_sample = int(seg["start"] * 16000)
         end_sample = int(seg["end"] * 16000)
         chunk = wav16k[start_sample:end_sample]
-        if chunk.shape[0] < 16000:  # 1.0초 미만 스킵
+        if chunk.shape[0] < 4800:  # 0.3초 미만 스킵
             continue
         audio_chunks.append((chunk, 16000))
         valid_segments.append(seg)
@@ -349,6 +355,8 @@ def build_minutes(segments_with_text: list[dict], meeting_start_time) -> list[di
             "speaker_label": seg["speaker"],
             "timestamp": (meeting_start_time + timedelta(seconds=seg['start'])).strftime("%Y-%m-%dT%H:%M:%S"),
             "content": seg["text"],
+            "start": seg['start'],
+            "end": seg['end'],
             "confidence": None,  # ASR 모델에서 confidence 점수 제공 시 여기에 추가 가능
         })
         i += 1
