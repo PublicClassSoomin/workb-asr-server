@@ -5,10 +5,165 @@ from core.models import aligner, pyannote_pipeline, asr
 from scipy.spatial.distance import cosine
 import torch
 from datetime import timedelta
+from dataclasses import dataclass
+from typing import Optional
 
 MAX_ALIGN_SEC = config.WINDOW_SEC
 _PAUSE_THRESHOLD = config._PAUSE_THRESHOLD
 _SENT_ENDERS = frozenset("。．.！!？?")   # 구두점 기반 (보조)
+
+# --------------------------------------------------------------------------- #
+# Speaker identity data structures                                              #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class SpeakerIdentity:
+    """단일 화자의 식별 정보."""
+    user_id: Optional[int]     # 등록된 참가자 ID, 없으면 None
+    display_name: str          # 표시 이름 ("김철수" 또는 "알 수 없음 Speaker N")
+    match_score: float         # 참가자 임베딩 매칭 점수 (0.0 ~ 1.0)
+    matched: bool              # 등록 참가자와 매칭 여부
+
+
+class SpeakerRegistry:
+    """
+    회의 전체에서 안정적인 speaker ID를 유지하는 레지스트리.
+
+    슬라이딩 윈도우마다 pyannote가 새 레이블을 부여해도
+    cosine similarity로 동일 화자를 추적한다.
+    """
+
+    _REGISTRY_THRESHOLD: float = 0.75    # 동일 화자 판정 임계값
+    _PARTICIPANT_THRESHOLD: float = 0.50  # 등록 참가자 매칭 임계값
+
+    def __init__(self) -> None:
+        self._embeddings: dict = {}   # spk_id → 정규화 임베딩 (np.ndarray)
+        self._identities: dict = {}   # spk_id → SpeakerIdentity
+        self._next_idx: int = 1
+
+    # ── internal helpers ──────────────────────────────────────────────────── #
+
+    def _alloc_spk_id(self) -> str:
+        spk_id = f"spk_{self._next_idx:02d}"
+        self._next_idx += 1
+        return spk_id
+
+    @staticmethod
+    def _normalize(arr: np.ndarray) -> "Optional[np.ndarray]":
+        n = float(np.linalg.norm(arr))
+        return arr / n if n >= 1e-6 else None
+
+    def _best_registry_match(self, emb_norm: np.ndarray) -> tuple:
+        """기존 레지스트리에서 가장 유사한 화자를 반환. (spk_id, score)"""
+        best_id, best_score = None, self._REGISTRY_THRESHOLD - 1e-9
+        for spk_id, reg_emb in self._embeddings.items():
+            score = float(1.0 - cosine(emb_norm, reg_emb))
+            if score > best_score:
+                best_score, best_id = score, spk_id
+        return best_id, best_score
+
+    def _best_participant_match(
+        self,
+        emb_norm: np.ndarray,
+        participants_embeddings: dict,
+        participants_names: dict,
+    ) -> tuple:
+        """등록된 참가자 중 가장 유사한 화자를 반환. (user_id, score, display_name)"""
+        best_uid, best_score = None, self._PARTICIPANT_THRESHOLD - 1e-9
+        for uid, p_emb in participants_embeddings.items():
+            p_arr = np.array(p_emb).flatten()
+            if p_arr.size == 0:
+                continue
+            p_norm = self._normalize(p_arr)
+            if p_norm is None:
+                continue
+            score = float(1.0 - cosine(emb_norm, p_norm))
+            if score > best_score:
+                best_score, best_uid = score, uid
+        if best_uid is not None:
+            return best_uid, best_score, participants_names.get(best_uid, f"Speaker {best_uid}")
+        return None, 0.0, ""
+
+    # ── public API ─────────────────────────────────────────────────────────── #
+
+    def resolve_window(
+        self,
+        pyannote_labels: list,
+        pyannote_embeddings,
+        participants_embeddings: dict,
+        participants_names: dict,
+    ) -> dict:
+        """
+        pyannote 레이블 + 임베딩을 안정적인 spk_id로 매핑.
+        레지스트리를 갱신하고 {pyannote_label: spk_id} 를 반환.
+        """
+        label_to_spk: dict = {}
+
+        for label, raw_emb in zip(pyannote_labels, pyannote_embeddings):
+            emb_arr = np.array(raw_emb).flatten()
+            emb_norm = self._normalize(emb_arr)
+            if emb_norm is None:
+                print(f"[DEBUG] pyannote 레이블 {label}: 제로 임베딩, 스킵")
+                continue
+
+            existing_id, reg_score = self._best_registry_match(emb_norm)
+
+            if existing_id is not None:
+                # 동일 화자 발견 → rolling-average 임베딩 업데이트
+                alpha = 0.9
+                updated = alpha * self._embeddings[existing_id] + (1.0 - alpha) * emb_norm
+                normed = self._normalize(updated)
+                if normed is not None:
+                    self._embeddings[existing_id] = normed
+
+                # 아직 참가자 미매칭이면 재시도
+                if not self._identities[existing_id].matched:
+                    uid, score, name = self._best_participant_match(
+                        emb_norm, participants_embeddings, participants_names
+                    )
+                    if uid is not None:
+                        self._identities[existing_id] = SpeakerIdentity(
+                            user_id=uid,
+                            display_name=name,
+                            match_score=round(score, 4),
+                            matched=True,
+                        )
+
+                label_to_spk[label] = existing_id
+                print(f"[DEBUG] {label} → 기존 {existing_id} (유사도={reg_score:.4f})")
+            else:
+                # 신규 화자 등록
+                new_id = self._alloc_spk_id()
+                self._embeddings[new_id] = emb_norm
+
+                uid, score, name = self._best_participant_match(
+                    emb_norm, participants_embeddings, participants_names
+                )
+                if uid is not None:
+                    self._identities[new_id] = SpeakerIdentity(
+                        user_id=uid,
+                        display_name=name,
+                        match_score=round(score, 4),
+                        matched=True,
+                    )
+                else:
+                    spk_num = self._next_idx - 1
+                    self._identities[new_id] = SpeakerIdentity(
+                        user_id=None,
+                        display_name=f"알 수 없음 Speaker {spk_num}",
+                        match_score=0.0,
+                        matched=False,
+                    )
+
+                label_to_spk[label] = new_id
+                print(f"[DEBUG] {label} → 신규 {new_id} 등록")
+
+        return label_to_spk
+
+    @property
+    def identities(self) -> dict:
+        """현재 레지스트리의 {spk_id: SpeakerIdentity} 복사본 반환."""
+        return dict(self._identities)
 
 def serialize_timestamps(ts_results):
     """ForcedAligner 결과를 JSON 직렬화 가능한 리스트로 변환."""
@@ -45,49 +200,41 @@ def align_chunk(audio_chunks, text, language, time_offset):
         print(f"Alignment failed: {e}")
         return []
     
-def run_diarization(wav16k: np.ndarray, embedding_speakers) -> tuple[list[dict], dict[str, str]]:
+def run_diarization(
+    wav16k: np.ndarray,
+    participants_embeddings: dict,
+    participants_names: dict,
+    registry: SpeakerRegistry,
+) -> tuple[list[dict], dict]:
     """
-    화자분리를 수행하여 화자 세그먼트 리스트와 화자 이름 맵을 반환.
-    Returns: (segments, spk_name_map)
+    화자분리를 수행하여 화자 세그먼트 리스트와 speaker identity map을 반환.
+
+    SpeakerRegistry를 통해 슬라이딩 윈도우 간 화자 ID가 안정적으로 유지된다.
+
+    Returns: (segments, identity_map)
       - segments: [{"speaker": "spk_01", "start": 0.0, "end": 2.5}, ...]
-      - spk_name_map: {"spk_01": "김사과", "spk_02": "알 수 없음 Speaker 2", ...}
+      - identity_map: {"spk_01": SpeakerIdentity(...), ...}
     """
     waveform = torch.from_numpy(wav16k).unsqueeze(0)  # (1, n_samples)
     audio_input = {"waveform": waveform, "sample_rate": 16000}
 
     diarization = pyannote_pipeline(audio_input, return_embeddings=True)
-    # print(f"[INFO] 화자분리 완료: \n {diarization}")
 
-    diarization_names = diarization.speaker_diarization.labels()
-    print(f"[DEBUG] pyannote 감지 화자 수: {len(diarization_names)}, 레이블: {diarization_names}")
-    spk_id_map = {diarization_names[i]: f"spk_{i+1:02d}" for i in range(len(diarization_names))}
-    spk_name_map = {f"spk_{i+1:02d}": f"알 수 없음 Speaker {i+1}" for i in range(len(diarization_names))}
+    pyannote_labels = diarization.speaker_diarization.labels()
+    print(f"[DEBUG] pyannote 감지 화자 수: {len(pyannote_labels)}, 레이블: {pyannote_labels}")
 
-    i = 0
-    for e in diarization.speaker_embeddings:
-        # 노름이 0인 제로 임베딩(실제 발화 없는 허상 화자) → cosine 계산 불가, 스킵
-        if np.linalg.norm(e) < 1e-6:
-            print(f"[DEBUG] 화자 {diarization_names[i]}: 제로 임베딩, 스킵")
-            i += 1
-            continue
+    # registry를 통해 안정적인 spk_id 매핑 획득
+    label_to_spk = registry.resolve_window(
+        pyannote_labels,
+        list(diarization.speaker_embeddings),
+        participants_embeddings,
+        participants_names,
+    )
 
-        spk_id = f"spk_{i+1:02d}"
-        scores = []
-        ids = []
-        for id, emb in embedding_speakers.items():
-            emb_arr = np.array(emb).flatten()
-            if emb_arr.size == 0:  # 빈 임베딩 스킵
-                continue
-            score = 1 - cosine(emb_arr, np.array(e).flatten())
-            scores.append(score)
-            ids.append(id)
-            print(f"[DEBUG] 화자 {diarization_names[i]} vs {id}: 유사도={score:.4f}")
-        if scores and max(scores) >= 0.5:
-            idx = scores.index(max(scores))
-            spk_name_map[spk_id] = ids[idx]
-        i += 1
-
-    diarization.speaker_diarization.rename_labels(spk_id_map, copy=False)
+    # pyannote 레이블을 안정적인 spk_id로 rename
+    rename_map = {lbl: label_to_spk[lbl] for lbl in pyannote_labels if lbl in label_to_spk}
+    if rename_map:
+        diarization.speaker_diarization.rename_labels(rename_map, copy=False)
 
     # community-1은 DiarizeOutput.speaker_diarization으로 순회
     try:
@@ -95,17 +242,22 @@ def run_diarization(wav16k: np.ndarray, embedding_speakers) -> tuple[list[dict],
     except AttributeError:
         iterable = ((turn, speaker) for turn, _, speaker in diarization.itertracks(yield_label=True))
 
+    valid_spk_ids = set(label_to_spk.values())
     segments = []
     for turn, speaker in iterable:
+        # 제로 임베딩으로 스킵된 레이블은 segments에서 제외
+        if speaker not in valid_spk_ids:
+            continue
         segments.append({
-            "speaker": speaker, # spk_01, spk_02거나 embedding과 매칭된 이름
+            "speaker": speaker,
             "start": round(turn.start, 3),
             "end": round(turn.end, 3),
         })
 
     segments.sort(key=lambda s: s["start"])
+    identity_map = registry.identities
     print(f"[DEBUG] 화자분리 세그먼트 수: {len(segments)}, 화자별: { {s['speaker'] for s in segments} }")
-    return segments, spk_name_map
+    return segments, identity_map
 
 def merge_to_sentences(word_timestamps):
     if not word_timestamps:
@@ -154,21 +306,48 @@ def assign_speakers(
     word_timestamps: list[dict],
     diarization_segments: list[dict],
     margin: float = 0.1,
-    min_segment_duration: float = 0.3,) -> list[dict]:
+    min_segment_duration: float = 0.3,
+) -> list[dict]:
+    """
+    각 단어에 화자를 할당한다.
 
+    midpoint 기준 대신 word-segment overlap duration을 계산하여
+    가장 많이 겹치는 화자를 선택한다.
+    매칭 실패 시 직전 화자(fallback)를 사용하고,
+    직전 화자도 없으면 "unknown"으로 처리한다.
+    """
     valid_segments = [
         seg for seg in diarization_segments
         if (seg["end"] - seg["start"]) >= min_segment_duration
     ]
 
-    result = []
+    result: list[dict] = []
+    last_speaker: Optional[str] = None
+
     for w in word_timestamps:
-        mid = (w["start"] + w["end"]) / 2
+        word_dur = max(w["end"] - w["start"], 1e-6)
+        best_spk: Optional[str] = None
+        best_overlap = 0.0
+
         for seg in valid_segments:
-            if (seg["start"] - margin) <= mid <= (seg["end"] + margin):
-                result.append({**w, "speaker": seg["speaker"]})
-                break
-        # 매칭 없으면 제외
+            seg_start = seg["start"] - margin
+            seg_end   = seg["end"]   + margin
+            overlap = max(0.0, min(w["end"], seg_end) - max(w["start"], seg_start))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_spk = seg["speaker"]
+
+        overlap_ratio = round(best_overlap / word_dur, 3)
+
+        if best_spk is not None:
+            last_speaker = best_spk
+            result.append({**w, "speaker": best_spk, "overlap_ratio": overlap_ratio})
+        elif last_speaker is not None:
+            # fallback: 직전 화자
+            result.append({**w, "speaker": last_speaker, "overlap_ratio": 0.0})
+        else:
+            result.append({**w, "speaker": "unknown", "overlap_ratio": 0.0})
+
     return result
 
 def merge_speaker_utterances(speaker_words: list[dict]) -> list[dict]:
@@ -205,69 +384,24 @@ def merge_speaker_utterances(speaker_words: list[dict]) -> list[dict]:
     })
     return utterances
 
-def offline_diarization(wav16k: np.ndarray, participants_embeddings) -> list[dict]:
-    pipeline = pyannote_pipeline
+def offline_diarization(
+    wav16k: np.ndarray,
+    participants_embeddings: dict,
+    participants_names: dict,
+    registry: SpeakerRegistry,
+) -> tuple[list[dict], dict]:
+    """
+    오프라인 전체 오디오 화자분리 (streaming 종료 후 실행).
 
-    # pyannote는 (waveform, sample_rate) dict 형태로 메모리 입력 지원
-    waveform = torch.from_numpy(wav16k).unsqueeze(0)  # (1, n_samples)
-    audio_input = {"waveform": waveform, "sample_rate": 16000}
-
-    diarization = pipeline(audio_input, return_embeddings=True)
-    print(f"[INFO] 화자분리 완료: \n {diarization}")
-    print(f"[INFO] 화자분리 세그먼트: {type(diarization.speaker_diarization)}")
-    # 화자 라벨 → 번호 매핑
-    segments = []
-
-    # 등록된 임베딩과 비교
-    embedding_speakers = participants_embeddings # {user_id: embedding}
-    diarization_names = diarization.speaker_diarization.labels()
-    
-    spk_id_map = {diarization_names[i]: f"spk_{i+1:02d}" for i in range(len(diarization_names))}
-    spk_name_map = {f"spk_{i+1:02d}": f"알 수 없음 Speaker {i+1}" for i in range(len(diarization_names))}
-
-    i = 0
-    for e in diarization.speaker_embeddings:
-        # 노름이 0인 제로 임베딩(실제 발화 없는 허상 화자) → cosine 계산 불가, 스킵
-        if np.linalg.norm(e) < 1e-6:
-            print(f"[DEBUG] 화자 {diarization_names[i]}: 제로 임베딩, 스킵")
-            i += 1
-            continue
-
-        spk_id = f"spk_{i+1:02d}"
-        scores = []
-        names = []
-        for id, emb in embedding_speakers.items():
-            emb_arr = np.array(emb).flatten()
-            if emb_arr.size == 0:  # 빈 임베딩 스킵
-                continue
-            score = 1 - cosine(emb_arr, np.array(e).flatten())
-            scores.append(score)
-            names.append(id)
-            print(f"[DEBUG] 화자 {diarization_names[i]} vs {id}: 유사도={score:.4f}")
-        if scores and max(scores) >= 0.5:
-            idx = scores.index(max(scores))
-            spk_name_map[spk_id] = names[idx]
-        i += 1
-
-    diarization.speaker_diarization.rename_labels(spk_id_map, copy=False)
-
-
-    # community-1은 DiarizeOutput.speaker_diarization으로 순회
-    try:
-        iterable = diarization.speaker_diarization
-    except AttributeError:
-        # fallback: 기존 pyannote Annotation 객체인 경우
-        iterable = ((turn, speaker) for turn, _, speaker in diarization.itertracks(yield_label=True))
-
-    for turn, speaker in iterable:
-        segments.append({
-            "speaker": speaker, # spk_01, spk_02거나 embedding과 매칭된 이름
-            "start": round(turn.start, 3),
-            "end": round(turn.end, 3),
-        })
-
-    segments.sort(key=lambda s: s["start"])
-    return segments, spk_name_map
+    streaming 단계에서 쌓인 registry를 재사용하므로
+    spk_id가 실시간 단계와 일관되게 유지된다.
+    """
+    print("[INFO] 오프라인 화자분리 시작...")
+    segments, identity_map = run_diarization(
+        wav16k, participants_embeddings, participants_names, registry
+    )
+    print(f"[INFO] 오프라인 화자분리 완료: {len(segments)}개 세그먼트")
+    return segments, identity_map
 
 def offline_asr(wav16k: np.ndarray) -> str:
     """오프라인 전사: 전체 오디오를 배치 전사하여 텍스트 반환."""
@@ -291,13 +425,13 @@ def offline_asr_chunked(wav16k: np.ndarray, segments: list[dict]) -> list[dict]:
     merged = [segments[0].copy()]
     for seg in segments[1:]:
         prev = merged[-1]
-        if seg["speaker"] == prev["speaker"] and seg["start"] - prev["end"] < 0.5:
+        if seg["speaker"] == prev["speaker"] and seg["start"] - prev["end"] < 0.0:
             prev["end"] = seg["end"]
         else:
             merged.append(seg.copy())
 
-    # 너무 짧은 세그먼트 필터 (0.3초 미만)
-    merged = [s for s in merged if s["end"] - s["start"] >= 0.3]
+    # 너무 짧은 세그먼트 필터 (1초 미만)
+    merged = [s for s in merged if s["end"] - s["start"] >= 1.0]
     if not merged:
         return []
 
@@ -308,7 +442,7 @@ def offline_asr_chunked(wav16k: np.ndarray, segments: list[dict]) -> list[dict]:
         start_sample = int(seg["start"] * 16000)
         end_sample = int(seg["end"] * 16000)
         chunk = wav16k[start_sample:end_sample]
-        if chunk.shape[0] < 4800:  # 0.3초 미만 스킵
+        if chunk.shape[0] < 16000:  # 1초 미만 스킵
             continue
         audio_chunks.append((chunk, 16000))
         valid_segments.append(seg)

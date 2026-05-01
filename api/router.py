@@ -6,7 +6,12 @@ from core.models import asr, aligner, pyannote_pipeline
 from db.mysql import get_participants, get_participants_embeddings, get_meeting_info, save_user_embedding
 import threading
 from services.audio_utils import bytes_to_wav16k
-from services.diarization import align_chunk, assign_speakers, merge_speaker_utterances,run_diarization, merge_to_sentences, offline_diarization, offline_asr_chunked, offline_asr, build_minutes
+from services.diarization import (
+    align_chunk, assign_speakers, merge_speaker_utterances,
+    run_diarization, merge_to_sentences, offline_diarization,
+    offline_asr_chunked, offline_asr, build_minutes,
+    SpeakerRegistry, SpeakerIdentity,
+)
 from services.text_util import fix_spacing_with_kiwi
 import numpy as np
 import torch
@@ -108,11 +113,10 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
 
     # ── 화자분리 상태 ──────────────────────────────────────
     diarization_segments: list[dict] = []  # 최신 pyannote 화자분리 결과
-    spk_name_map: dict = {}               # spk_XX → 실제 이름
+    identity_map: dict = {}               # spk_id → SpeakerIdentity
+    speaker_registry = SpeakerRegistry()  # 회의 전체 화자 레지스트리 (spk_id 안정화)
     last_diarize_samples = 0               # 마지막 화자분리 실행 시점의 누적 샘플 수
-    diarize_dirty = False              # 새 화자분리 결과 발생 시 True
-    diarize_history_spk_map: dict = {}    # 10분 window 초과 시 누적된 화자 맵
-    spk_id_map: dict = {}                 # spk_xx → userId (Redis 저장용)
+    diarize_dirty = False                  # 새 화자분리 결과 발생 시 True
 
     with asr_lock:
         state = asr.init_streaming_state(
@@ -198,8 +202,9 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
                             window_audio = np.concatenate(selected_chunks)[-win_samples:]
                             time_offset = (total_received_samples - win_samples) / 16000
 
-                            new_segs, new_spk_map = run_diarization(window_audio, participants_embeddings)
-
+                            new_segs, identity_map = run_diarization(
+                                window_audio, participants_embeddings, participants, speaker_registry
+                            )
                             # 절대 시간으로 보정
                             for seg in new_segs:
                                 seg["start"] = round(seg["start"] + time_offset, 3)
@@ -208,24 +213,12 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
                             # window 이전 세그먼트는 이전 결과 재사용
                             old_segs = [s for s in diarization_segments if s["end"] <= time_offset]
                             diarization_segments = old_segs + new_segs
-
-                            # 화자 맵: 누적 히스토리 + 새 결과 병합 (새 결과 우선)
-                            diarize_history_spk_map = {**diarize_history_spk_map, **new_spk_map}
-                            spk_name_map = diarize_history_spk_map
                         else:
                             slide_audio = np.concatenate(full_audio_chunks)
-                            diarization_segments, spk_name_map = run_diarization(slide_audio, participants_embeddings)
-                            diarize_history_spk_map = dict(spk_name_map)
+                            diarization_segments, identity_map = run_diarization(
+                                slide_audio, participants_embeddings, participants, speaker_registry
+                            )
 
-                        # spk_xx → userId 매핑 저장 (이름 변환 전, Redis 저장용)
-                        spk_id_map = {spk: uid for spk, uid in spk_name_map.items() if isinstance(uid, int)}
-
-                        # spk_name_map을 실제 이름으로 업데이트
-                        for spk, name in spk_name_map.items():
-                            if type(name) == int:
-                                spk_name_map[spk] = participants[name]
-                        # 이름 변환 결과를 히스토리에도 반영
-                        diarize_history_spk_map.update(spk_name_map)
                         diarize_dirty = True
                     except Exception as _exc:
                         print(f"[ERROR] sliding diarization: {_exc}")
@@ -250,8 +243,14 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
                     ts_dirty = False
                 if diarize_dirty and committed_timestamps and diarization_segments:
                     _r = get_redis()
-                    if spk_id_map:
-                        await _r.hset(f"meeting:{meeting_id}:speakers", mapping={k: str(v) for k, v in spk_id_map.items()})
+                    # spk_id → user_id 맵핑 Redis 저장
+                    spk_user_map = {
+                        spk: str(idn.user_id)
+                        for spk, idn in identity_map.items()
+                        if idn.user_id is not None
+                    }
+                    if spk_user_map:
+                        await _r.hset(f"meeting:{meeting_id}:speakers", mapping=spk_user_map)
                         await _r.expire(f"meeting:{meeting_id}:speakers", REDIS_TTL_SEC)
                     speaker_words = assign_speakers(committed_timestamps, diarization_segments)
                     utterances = merge_speaker_utterances(speaker_words)
@@ -261,8 +260,14 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
                         content = _clean_content(utt["text"])
                         if not content:
                             continue
+                        spk_id = utt["speaker"]
+                        idn = identity_map.get(spk_id) or SpeakerIdentity(
+                            user_id=None, display_name=spk_id, match_score=0.0, matched=False
+                        )
                         await _r.rpush(f"meeting:{meeting_id}:utterances", json.dumps({
-                            "speaker_id": utt["speaker"],
+                            "speaker_id": spk_id,
+                            "user_id": idn.user_id,
+                            "display_name": idn.display_name,
                             "content": content,
                             "timestamp": ts,
                         }, ensure_ascii=False))
@@ -271,7 +276,7 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
                     diarization_resp = []
                     for raw in raw_utts:
                         item = json.loads(raw)
-                        item["speaker"] = spk_name_map.get(item["speaker_id"], item["speaker_id"])
+                        item["speaker"] = item.get("display_name", item.get("speaker_id", "unknown"))
                         diarization_resp.append(item)
                     response["diarization"] = diarization_resp
                     diarize_dirty = False
@@ -296,22 +301,23 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
         print(f"[INFO] 오디오 저장 완료: {audio_path}")
 
         # 1) 화자분리 (CPU — GPU 점유 없음)
-        diarize_segments, spk_name_map = offline_diarization(wav16k, participants_embeddings)
+        diarize_segments, offline_identity_map = offline_diarization(
+            wav16k, participants_embeddings, participants, speaker_registry
+        )
 
         # 2) 화자 세그먼트별 ASR
         segments_with_text = offline_asr_chunked(wav16k, diarize_segments)
 
-        # 3) spk_name_map으로 speaker_id 해소 (spk_id → user_id)
-        # seg["speaker"]는 항상 "spk_01" 형태의 문자열이므로 spk_name_map에서 resolve
+        # 3) identity_map으로 speaker 정보 해소
         for seg in segments_with_text:
-            spk_id = seg["speaker"]          # "spk_01" 등 문자열
-            resolved = spk_name_map.get(spk_id)  # int(user_id) or "알 수 없음 ..." or None
-            if isinstance(resolved, int):
-                seg["speaker_id"] = resolved
-                seg["speaker"] = participants.get(resolved, spk_id)
+            spk_id = seg["speaker"]
+            idn = offline_identity_map.get(spk_id)
+            if idn:
+                seg["speaker_id"] = idn.user_id
+                seg["speaker"] = idn.display_name
             else:
                 seg["speaker_id"] = None
-                seg["speaker"] = resolved if resolved else spk_id
+                seg["speaker"] = spk_id
 
         # 4) 세그먼트가 없으면 넘어가
         if not segments_with_text:
