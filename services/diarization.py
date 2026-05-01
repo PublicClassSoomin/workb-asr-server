@@ -305,8 +305,8 @@ def merge_to_sentences(word_timestamps):
 def assign_speakers(
     word_timestamps: list[dict],
     diarization_segments: list[dict],
-    margin: float = 0.1,
-    min_segment_duration: float = 0.3,
+    margin: float = 0.0,
+    min_segment_duration: float = 1.0,
 ) -> list[dict]:
     """
     각 단어에 화자를 할당한다.
@@ -420,18 +420,21 @@ def offline_asr_chunked(wav16k: np.ndarray, segments: list[dict]) -> list[dict]:
     """
     if not segments:
         return []
+    
+    FILTER_SEC = 0.8
+    MERGE_SEC = 0.5
 
     # 인접 동일 화자 병합
     merged = [segments[0].copy()]
     for seg in segments[1:]:
         prev = merged[-1]
-        if seg["speaker"] == prev["speaker"] and seg["start"] - prev["end"] < 0.0:
+        if seg["speaker"] == prev["speaker"] and seg["start"] - prev["end"] < MERGE_SEC:
             prev["end"] = seg["end"]
         else:
             merged.append(seg.copy())
 
     # 너무 짧은 세그먼트 필터 (1초 미만)
-    merged = [s for s in merged if s["end"] - s["start"] >= 1.0]
+    merged = [s for s in merged if s["end"] - s["start"] >= FILTER_SEC]
     if not merged:
         return []
 
@@ -442,7 +445,7 @@ def offline_asr_chunked(wav16k: np.ndarray, segments: list[dict]) -> list[dict]:
         start_sample = int(seg["start"] * 16000)
         end_sample = int(seg["end"] * 16000)
         chunk = wav16k[start_sample:end_sample]
-        if chunk.shape[0] < 16000:  # 1초 미만 스킵
+        if chunk.shape[0] < 16000 * FILTER_SEC:  # 1초 미만 스킵
             continue
         audio_chunks.append((chunk, 16000))
         valid_segments.append(seg)
