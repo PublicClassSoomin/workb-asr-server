@@ -5,7 +5,7 @@ from core.config import config
 from core.models import asr, aligner, pyannote_pipeline
 from db.mysql import get_participants, get_participants_embeddings, get_meeting_info, save_user_embedding
 import threading
-from services.audio_utils import bytes_to_wav16k
+from services.audio_utils import bytes_to_wav16k, preprocess_audio_bytes, preprocess_saved_audio
 from services.diarization import (
     align_chunk, assign_speakers, merge_speaker_utterances,
     run_diarization, merge_to_sentences, offline_diarization,
@@ -17,7 +17,6 @@ import numpy as np
 import torch
 import json
 import soundfile as sf
-import os
 from datetime import datetime, timezone, timedelta
 from db.redis_client import get_redis
 from db.mongodb import upload_mongodb
@@ -293,20 +292,30 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
         wav16k = np.concatenate(full_audio_chunks)
         duration = round(wav16k.shape[0] / 16000, 2)
 
-        # 전체 오디오 src 폴더에 저장
-        src_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "src")
-        os.makedirs(src_dir, exist_ok=True)
-        audio_path = os.path.join(src_dir, f"meeting_{meeting_id}.wav")
+        # 전체 오디오는 원본으로 저장하고, 이후 전처리본으로 후처리를 진행한다.
+        STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        audio_path = STORAGE_ROOT / f"meeting_{meeting_id}.wav"
+        preprocessed_audio_path = STORAGE_ROOT / f"meeting_{meeting_id}_preprocessed.wav"
         sf.write(audio_path, wav16k, 16000)
-        print(f"[INFO] 오디오 저장 완료: {audio_path}")
+        print(f"[INFO] 원본 오디오 저장 완료: {audio_path}")
+
+        diarization_audio = wav16k
+        try:
+            processed_path, diarization_audio = preprocess_saved_audio(
+                audio_path,
+                preprocessed_audio_path,
+            )
+            print(f"[INFO] 전처리 오디오 생성 완료: {processed_path}")
+        except Exception as exc:
+            print(f"[WARN] 오디오 전처리 실패, 원본으로 계속 진행합니다: {exc}")
 
         # 1) 화자분리 (CPU — GPU 점유 없음)
         diarize_segments, offline_identity_map = offline_diarization(
-            wav16k, participants_embeddings, participants, speaker_registry
+            diarization_audio, participants_embeddings, participants, speaker_registry
         )
 
         # 2) 화자 세그먼트별 ASR
-        segments_with_text = offline_asr_chunked(wav16k, diarize_segments)
+        segments_with_text = offline_asr_chunked(diarization_audio, diarize_segments)
 
         # 3) identity_map으로 speaker 정보 해소
         for seg in segments_with_text:
@@ -339,7 +348,11 @@ async def update_embedding(user_id: int, audio: UploadFile = File(...)):
     # FormData의 audio 필드로 WAV 파일을 받아 임베딩 등록
     # 앞뒤로 2초씩 자르기
     audio_bytes = await audio.read()
-    wav16k = bytes_to_wav16k(audio_bytes)
+    try:
+        wav16k = preprocess_audio_bytes(audio_bytes)
+    except Exception as exc:
+        print(f"[WARN] 임베딩 등록용 오디오 전처리 실패, 원본으로 진행합니다: {exc}")
+        wav16k = bytes_to_wav16k(audio_bytes)
     wav16k = wav16k[32000:-32000] if wav16k.shape[0] > 64000 else wav16k
 
     embedding = pyannote_pipeline._embedding
