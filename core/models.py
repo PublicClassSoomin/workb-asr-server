@@ -20,10 +20,9 @@ class ASRModel:
             print("Loading ASR model …")
             self.asr = Qwen3ASRModel.LLM(
                 model=ASR_MODEL_PATH,
-                gpu_memory_utilization=0.55,
-                max_new_tokens=1024,
-                max_inference_batch_size=128,
-                max_model_len=4096,
+                gpu_memory_utilization=0.8,
+                # max_inference_batch_size=128,
+                max_model_len=16384*2,
             )
         print("ASR model ready.")
         return self.asr

@@ -388,15 +388,15 @@ def offline_diarization(
     wav16k: np.ndarray,
     participants_embeddings: dict,
     participants_names: dict,
-    registry: SpeakerRegistry,
 ) -> tuple[list[dict], dict]:
     """
     오프라인 전체 오디오 화자분리 (streaming 종료 후 실행).
 
-    streaming 단계에서 쌓인 registry를 재사용하므로
-    spk_id가 실시간 단계와 일관되게 유지된다.
+    전체 오디오를 기준으로 새 SpeakerRegistry를 사용해
+    streaming 단계의 화자 병합 상태를 이어받지 않는다.
     """
     print("[INFO] 오프라인 화자분리 시작...")
+    registry = SpeakerRegistry()
     segments, identity_map = run_diarization(
         wav16k, participants_embeddings, participants_names, registry
     )

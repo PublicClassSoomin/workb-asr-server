@@ -131,7 +131,7 @@ async def save_user_embedding(user_id: int, embedding: str):
     row = await fetch_one(query_check, (user_id,))
     
     if row["count"] > 0:
-        query_update = "UPDATE speaker_profiles SET voice_embedding = %s WHERE user_id = %s"
+        query_update = "UPDATE speaker_profiles SET voice_embedding = %s, updated_at = NOW() WHERE user_id = %s"
         await execute(query_update, (embedding, user_id))
     else:
         query_insert = (

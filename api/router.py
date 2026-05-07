@@ -1,10 +1,10 @@
 # 라우팅
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from core.config import config
 from core.models import asr, aligner, pyannote_pipeline
 from db.mysql import get_participants, get_participants_embeddings, get_meeting_info, save_user_embedding
-import threading
+import asyncio
 from services.audio_utils import bytes_to_wav16k, preprocess_audio_bytes, preprocess_saved_audio
 from services.diarization import (
     align_chunk, assign_speakers, merge_speaker_utterances,
@@ -38,7 +38,7 @@ HF_TOKEN = config.HF_TOKEN
 REDIS_TTL_SEC=config.REDIS_TTL_SEC
 DIARIZE_WINDOW_SEC = 600  # 화자분리 슬라이딩 윈도우 상한 (10분)
 
-asr_lock = threading.Lock()
+asr_lock = asyncio.Lock()
 
 _ASR_HALLUCINATION_PATTERN = re.compile(
     r"(system|user|assistant|language\s*\w+|asr\s*text)",
@@ -114,10 +114,19 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
     diarization_segments: list[dict] = []  # 최신 pyannote 화자분리 결과
     identity_map: dict = {}               # spk_id → SpeakerIdentity
     speaker_registry = SpeakerRegistry()  # 회의 전체 화자 레지스트리 (spk_id 안정화)
-    last_diarize_samples = 0               # 마지막 화자분리 실행 시점의 누적 샘플 수
     diarize_dirty = False                  # 새 화자분리 결과 발생 시 True
 
-    with asr_lock:
+    if asr_lock.locked():
+        await ws.send_json({
+            "message": "ASR server is busy. Please try again after the current meeting ends.",
+            "meeting_id": meeting_id,
+            "success": False,
+            "error": "ASR_BUSY",
+        })
+        await ws.close(code=1013)
+        return
+
+    async with asr_lock:
         state = asr.init_streaming_state(
             language=language,
             unfixed_chunk_num=2,
@@ -288,7 +297,12 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
 
         # ── 최종 처리 ─────────────────────────────────────────
         asr.finish_streaming_transcribe(state)
-        
+
+        if not full_audio_chunks:
+            print("[WARN] No audio chunks received, skipping final processing.")
+            await ws.send_json({"message": "No audio chunks received, skipping final processing.", "meeting_id": meeting_id})
+            await ws.close()
+            return
         wav16k = np.concatenate(full_audio_chunks)
         duration = round(wav16k.shape[0] / 16000, 2)
 
@@ -311,7 +325,7 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
 
         # 1) 화자분리 (CPU — GPU 점유 없음)
         diarize_segments, offline_identity_map = offline_diarization(
-            diarization_audio, participants_embeddings, participants, speaker_registry
+            diarization_audio, participants_embeddings, participants
         )
 
         # 2) 화자 세그먼트별 ASR
@@ -331,6 +345,7 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
         # 4) 세그먼트가 없으면 넘어가
         if not segments_with_text:
             print("No segments with text were generated, skipping MongoDB upload.")
+            await ws.send_json({"message": "Meeting processing complete", "meeting_id": meeting_id})
             await ws.close()
             return
 
@@ -368,8 +383,60 @@ async def update_embedding(user_id: int, audio: UploadFile = File(...)):
     await save_user_embedding(user_id, emb_str)
     return {"message": f"성공적으로 저장되었습니다."}
 
+@router.post("/test")
+async def test_endpoint(file: UploadFile = File(...), meeting_id: str = Query(...), workspace_id: str = Query(...)):
+    if workspace_id is None:
+        workspace_id = "2"
+    meeting_start_time = datetime.now(timezone.utc) + timedelta(hours=9)
 
+    # 파일을 받아서 전처리
+    audio_bytes = await file.read()
+    # 샘플레이트 알아내기
 
+    try:
+        wav16k = preprocess_audio_bytes(audio_bytes)
+    except Exception as exc:
+        print(f"[WARN] 테스트용 오디오 전처리 실패, 원본으로 진행합니다: {exc}")
+        wav16k = bytes_to_wav16k(audio_bytes)
+    audio_path = STORAGE_ROOT / f"meeting_{meeting_id}.wav"
 
+    sf.write(audio_path, wav16k, 16000)
 
+    diarization_audio = wav16k
+    duration = round(float(wav16k.shape[0]) / 16000.0, 3)
+    
+    participants_embeddings = {}  # 테스트에서는 임베딩 없이 진행
+    participants = {}  # 테스트에서는 참가자 정보 없이 진행
+
+    # 1) 화자분리 (CPU — GPU 점유 없음)
+    diarize_segments, offline_identity_map = offline_diarization(
+        diarization_audio, participants_embeddings, participants
+    )
+
+    # 2) 화자 세그먼트별 ASR
+    segments_with_text = offline_asr_chunked(diarization_audio, diarize_segments)
+
+    # 3) identity_map으로 speaker 정보 해소
+    for seg in segments_with_text:
+        spk_id = seg["speaker"]
+        idn = offline_identity_map.get(spk_id)
+        if idn:
+            seg["speaker_id"] = idn.user_id
+            seg["speaker"] = idn.display_name
+        else:
+            seg["speaker_id"] = None
+            seg["speaker"] = spk_id
+
+    # 4) 세그먼트가 없으면 넘어가
+    if not segments_with_text:
+        print("No segments with text were generated, skipping MongoDB upload.")
+        return {"message": "No segments with text were generated."}
+
+    minutes = build_minutes(segments_with_text, meeting_start_time)
+
+    # 몽고db에 저장
+    upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
+    print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
+
+    return {"message": "Test processing complete", "meeting_id": meeting_id}
 
