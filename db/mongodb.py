@@ -29,7 +29,7 @@ def get_db() -> AsyncIOMotorDatabase:
         raise RuntimeError("MongoDB가 초기화되지 않았습니다.")
     return db
 
-def upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time):
+async def upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time):
     """회의록을 몽고DB에 저장하는 함수"""
     now = datetime.now(timezone.utc) + timedelta(hours=9)
     collection = get_db()["utterances"]
@@ -42,4 +42,4 @@ def upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_ti
         "total_duration_sec": round(duration,0),
         "meeting_start_time": meeting_start_time
     }
-    collection.insert_one(document)
+    await collection.insert_one(document)

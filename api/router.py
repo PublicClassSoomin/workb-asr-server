@@ -352,7 +352,7 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
     minutes = build_minutes(segments_with_text, meeting_start_time)
 
     # 몽고db에 저장
-    upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
+    await upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
     print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
 
     await ws.send_json({"message": "Meeting processing complete", "meeting_id": meeting_id})
@@ -384,9 +384,22 @@ async def update_embedding(user_id: int, audio: UploadFile = File(...)):
     return {"message": f"성공적으로 저장되었습니다."}
 
 @router.post("/test")
-async def test_endpoint(file: UploadFile = File(...), meeting_id: str = Query(...), workspace_id: str = Query(...)):
+async def test_endpoint(
+    file: UploadFile = File(...),
+    meeting_id: str = Query(...),
+    workspace_id: str | None = Query(None),
+):
+    meeting_info = await get_meeting_info(meeting_id)
     if workspace_id is None:
-        workspace_id = "2"
+        workspace_id = meeting_info["workspace_id"] if meeting_info else "2"
+
+    participants = await get_participants(meeting_id)  # id:name 딕셔너리
+    participant_ids = list(participants.keys())
+    participants_embeddings = await get_participants_embeddings(participant_ids)
+    print(
+        f"[TEST] Participants: {participants}, Embeddings fetched for IDs: {list(participants_embeddings.keys())}"
+    )
+
     meeting_start_time = datetime.now(timezone.utc) + timedelta(hours=9)
 
     # 파일을 받아서 전처리
@@ -398,15 +411,14 @@ async def test_endpoint(file: UploadFile = File(...), meeting_id: str = Query(..
     except Exception as exc:
         print(f"[WARN] 테스트용 오디오 전처리 실패, 원본으로 진행합니다: {exc}")
         wav16k = bytes_to_wav16k(audio_bytes)
+
+    STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
     audio_path = STORAGE_ROOT / f"meeting_{meeting_id}.wav"
 
     sf.write(audio_path, wav16k, 16000)
 
     diarization_audio = wav16k
     duration = round(float(wav16k.shape[0]) / 16000.0, 3)
-    
-    participants_embeddings = {}  # 테스트에서는 임베딩 없이 진행
-    participants = {}  # 테스트에서는 참가자 정보 없이 진행
 
     # 1) 화자분리 (CPU — GPU 점유 없음)
     diarize_segments, offline_identity_map = offline_diarization(
@@ -435,7 +447,7 @@ async def test_endpoint(file: UploadFile = File(...), meeting_id: str = Query(..
     minutes = build_minutes(segments_with_text, meeting_start_time)
 
     # 몽고db에 저장
-    upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
+    await upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
     print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
 
     return {"message": "Test processing complete", "meeting_id": meeting_id}
