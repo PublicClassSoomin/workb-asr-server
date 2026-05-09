@@ -33,8 +33,8 @@ class SpeakerRegistry:
     cosine similarity로 동일 화자를 추적한다.
     """
 
-    _REGISTRY_THRESHOLD: float = 0.75    # 동일 화자 판정 임계값
-    _PARTICIPANT_THRESHOLD: float = 0.50  # 등록 참가자 매칭 임계값
+    _REGISTRY_THRESHOLD: float = 0.9    # 동일 화자 판정 임계값
+    _PARTICIPANT_THRESHOLD: float = 0.30  # 등록 참가자 매칭 임계값
 
     def __init__(self) -> None:
         self._embeddings: dict = {}   # spk_id → 정규화 임베딩 (np.ndarray)

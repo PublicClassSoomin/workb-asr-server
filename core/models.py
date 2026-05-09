@@ -1,5 +1,6 @@
 # 모델 불러오기
 from core.config import config
+import gc
 import os
 
 ASR_MODEL_PATH = os.getenv("ASR_MODEL_PATH")
@@ -30,6 +31,43 @@ class ASRModel:
     def __call__(self, *args, **kwds):
         self.asr = self.get_asr()
         return self.asr
+
+    def reset_runtime_caches(self) -> bool:
+        if self.asr is None:
+            return False
+
+        released = False
+        backend_model = getattr(self.asr, "model", None)
+
+        if backend_model is not None:
+            reset_prefix_cache = getattr(backend_model, "reset_prefix_cache", None)
+            if callable(reset_prefix_cache):
+                try:
+                    released = bool(reset_prefix_cache()) or released
+                except Exception as exc:
+                    print(f"[WARN] Failed to reset vLLM prefix cache: {exc}")
+
+            reset_mm_cache = getattr(backend_model, "reset_mm_cache", None)
+            if callable(reset_mm_cache):
+                try:
+                    reset_mm_cache()
+                    released = True
+                except Exception as exc:
+                    print(f"[WARN] Failed to reset vLLM multimodal cache: {exc}")
+
+        gc.collect()
+
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+        except Exception as exc:
+            print(f"[WARN] Failed to release CUDA allocator cache: {exc}")
+
+        return released
 
 class Aligner:
     def __init__(self):
@@ -77,6 +115,10 @@ class Diarizer:
 
 asrloader = ASRModel()
 asr = asrloader()
+
+
+def reset_asr_runtime_caches() -> bool:
+    return asrloader.reset_runtime_caches()
 
 aligner_loader = Aligner()
 aligner = aligner_loader()

@@ -2,7 +2,7 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from core.config import config
-from core.models import asr, aligner, pyannote_pipeline
+from core.models import asr, aligner, pyannote_pipeline, reset_asr_runtime_caches
 from db.mysql import get_participants, get_participants_embeddings, get_meeting_info, save_user_embedding
 import asyncio
 from services.audio_utils import bytes_to_wav16k, preprocess_audio_bytes, preprocess_saved_audio
@@ -51,6 +51,20 @@ def _clean_content(text: str) -> str:
     if not text:
         return ""
     return fix_spacing_with_kiwi(text)
+
+
+def _release_streaming_state(state) -> None:
+    if state is None:
+        return
+
+    if hasattr(state, "buffer"):
+        state.buffer = np.zeros((0,), dtype=np.float32)
+    if hasattr(state, "audio_accum"):
+        state.audio_accum = np.zeros((0,), dtype=np.float32)
+    if hasattr(state, "_raw_decoded"):
+        state._raw_decoded = ""
+    if hasattr(state, "text"):
+        state.text = ""
 
 
 router = APIRouter(prefix="/meeting")
@@ -127,227 +141,231 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
         return
 
     async with asr_lock:
-        state = asr.init_streaming_state(
-            language=language,
-            unfixed_chunk_num=2,
-            unfixed_token_num=5,
-            chunk_size_sec=2.0,
-        )
-        
         try:
-            while True:
-                data = await ws.receive_bytes()
+            state = asr.init_streaming_state(
+                language=language,
+                unfixed_chunk_num=2,
+                unfixed_token_num=5,
+                chunk_size_sec=2.0,
+            )
 
-                # ── 종료 신호: 빈 바이트 수신 ─────────────────
-                if len(data) == 0:
-                    break
+            try:
+                while True:
+                    data = await ws.receive_bytes()
 
-                # ── 오디오 전처리 및 스트리밍 추론 ───────────
-                wav16k = bytes_to_wav16k(data)
-                full_audio_chunks.append(wav16k)
-                total_received_samples += wav16k.shape[0]
-                asr.streaming_transcribe(wav16k, state)
+                    # ── 종료 신호: 빈 바이트 수신 ─────────────────
+                    if len(data) == 0:
+                        break
 
-                # ── 슬라이딩 윈도우 처리 ──────────────────────
-                if state.audio_accum.shape[0] >= max_samples:
-                    max_samples = int(WINDOW_SEC * 16000)  # 윈도우 크기만큼 슬라이드
+                    # ── 오디오 전처리 및 스트리밍 추론 ───────────
+                    wav16k = bytes_to_wav16k(data)
+                    full_audio_chunks.append(wav16k)
+                    total_received_samples += wav16k.shape[0]
+                    asr.streaming_transcribe(wav16k, state)
+
+                    # ── 슬라이딩 윈도우 처리 ──────────────────────
+                    if state.audio_accum.shape[0] >= max_samples:
+                        max_samples = int(WINDOW_SEC * 16000)  # 윈도우 크기만큼 슬라이드
+                        asr.finish_streaming_transcribe(state)
+
+                        # ① 확정: 오버랩 제외 텍스트를 accumulated_text에 커밋
+                        full_text = state.text or ""
+                        new_committed = full_text[overlap_text_len:]
+                        if new_committed:
+                            accumulated_text += new_committed + " "
+
+                        # ② 오버랩용 오디오 추출 (마지막 OVERLAP_SEC)
+                        overlap_audio = state.audio_accum[-overlap_samples:]
+
+                        # ③ 새 세션 초기화 + 오버랩 재투입
+                        state = asr.init_streaming_state(
+                            language=language,
+                            unfixed_chunk_num=2,
+                            unfixed_token_num=5,
+                            chunk_size_sec=2.0,
+                        )
+                        asr.streaming_transcribe(overlap_audio, state)
+                        overlap_text_len = len(state.text or "")
+
+                        # ── 확정 타임스탬프 정렬 (committed) ─────
+                        #   슬라이드로 텍스트가 확정되었으므로
+                        #   새로 확정된 오디오+텍스트를 정렬한다.
+                        #   확정 텍스트는 불변이므로 결과도 불변.
+                        committed_chunk_count = len(full_audio_chunks)
+                        new_chunks = full_audio_chunks[last_align_chunk_idx:committed_chunk_count]
+                        new_text = accumulated_text[last_align_text_len:].strip()
+                        if new_chunks and new_text:
+                            new_ts = align_chunk(
+                                new_chunks, new_text,
+                                state.language or language,
+                                last_align_time_offset,
+                            )
+                            committed_timestamps.extend(new_ts)
+                            chunk_samples = sum(c.shape[0] for c in new_chunks)
+                            last_align_time_offset += chunk_samples / 16000
+                            last_align_chunk_idx = committed_chunk_count
+                            last_align_text_len = len(accumulated_text)
+                        ts_dirty = True
+
+                        # ── 슬라이딩마다 화자분리 수행 (최근 10분 window) ──
+                        try:
+                            total_dur = total_received_samples / 16000
+
+                            if total_dur > DIARIZE_WINDOW_SEC:
+                                # 최근 10분에 해당하는 청크만 뒤에서부터 모아 concat
+                                win_samples = int(DIARIZE_WINDOW_SEC * 16000)
+                                selected_chunks = []
+                                collected = 0
+                                for chunk in reversed(full_audio_chunks):
+                                    selected_chunks.append(chunk)
+                                    collected += chunk.shape[0]
+                                    if collected >= win_samples:
+                                        break
+                                selected_chunks.reverse()
+                                window_audio = np.concatenate(selected_chunks)[-win_samples:]
+                                time_offset = (total_received_samples - win_samples) / 16000
+
+                                new_segs, identity_map = run_diarization(
+                                    window_audio, participants_embeddings, participants, speaker_registry
+                                )
+                                # 절대 시간으로 보정
+                                for seg in new_segs:
+                                    seg["start"] = round(seg["start"] + time_offset, 3)
+                                    seg["end"] = round(seg["end"] + time_offset, 3)
+
+                                # window 이전 세그먼트는 이전 결과 재사용
+                                old_segs = [s for s in diarization_segments if s["end"] <= time_offset]
+                                diarization_segments = old_segs + new_segs
+                            else:
+                                slide_audio = np.concatenate(full_audio_chunks)
+                                diarization_segments, identity_map = run_diarization(
+                                    slide_audio, participants_embeddings, participants, speaker_registry
+                                )
+
+                            diarize_dirty = True
+                        except Exception as _exc:
+                            print(f"[ERROR] sliding diarization: {_exc}")
+
+                    # ── 응답 전송 ─────────────────────────────────
+                    current_session_text = state.text or ""
+                    display_new = (
+                        current_session_text[overlap_text_len:]
+                        if len(current_session_text) > overlap_text_len
+                        else current_session_text
+                    )
+                    # display_text = (accumulated_text + display_new).strip()
+
+                    response = {
+                        "language": state.language or language,
+                        "text": display_new.strip(),
+                        "final": False,
+                    }
+                    if ts_dirty:
+                        # all_ts = committed_timestamps
+                        # response["sentences"] = merge_to_sentences(all_ts)
+                        ts_dirty = False
+                    if diarize_dirty and committed_timestamps and diarization_segments:
+                        _r = get_redis()
+                        # spk_id → user_id 맵핑 Redis 저장
+                        spk_user_map = {
+                            spk: str(idn.user_id)
+                            for spk, idn in identity_map.items()
+                            if idn.user_id is not None
+                        }
+                        if spk_user_map:
+                            await _r.hset(f"meeting:{meeting_id}:speakers", mapping=spk_user_map)
+                            await _r.expire(f"meeting:{meeting_id}:speakers", REDIS_TTL_SEC)
+                        speaker_words = assign_speakers(committed_timestamps, diarization_segments)
+                        utterances = merge_speaker_utterances(speaker_words)
+                        await _r.delete(f"meeting:{meeting_id}:utterances")
+                        for utt in utterances:
+                            ts = (meeting_start_time + timedelta(seconds=utt["start"])).strftime("%Y-%m-%dT%H:%M:%S")
+                            content = _clean_content(utt["text"])
+                            if not content:
+                                continue
+                            spk_id = utt["speaker"]
+                            idn = identity_map.get(spk_id) or SpeakerIdentity(
+                                user_id=None, display_name=spk_id, match_score=0.0, matched=False
+                            )
+                            await _r.rpush(f"meeting:{meeting_id}:utterances", json.dumps({
+                                "speaker_id": spk_id,
+                                "user_id": idn.user_id,
+                                "display_name": idn.display_name,
+                                "content": content,
+                                "timestamp": ts,
+                            }, ensure_ascii=False))
+                        await _r.expire(f"meeting:{meeting_id}:utterances", REDIS_TTL_SEC)
+                        raw_utts = await _r.lrange(f"meeting:{meeting_id}:utterances", 0, -1)
+                        diarization_resp = []
+                        for raw in raw_utts:
+                            item = json.loads(raw)
+                            item["speaker"] = item.get("display_name", item.get("speaker_id", "unknown"))
+                            diarization_resp.append(item)
+                        response["diarization"] = diarization_resp
+                        diarize_dirty = False
+                    await ws.send_json(response)
+                    await get_redis().set(f"meeting:{meeting_id}:latest", display_new.strip(), ex=REDIS_TTL_SEC)
+
+            except (WebSocketDisconnect, RuntimeError):
+                if asr:
                     asr.finish_streaming_transcribe(state)
 
-                    # ① 확정: 오버랩 제외 텍스트를 accumulated_text에 커밋
-                    full_text = state.text or ""
-                    new_committed = full_text[overlap_text_len:]
-                    if new_committed:
-                        accumulated_text += new_committed + " "
+            # ── 최종 처리 ─────────────────────────────────────────
+            asr.finish_streaming_transcribe(state)
 
-                    # ② 오버랩용 오디오 추출 (마지막 OVERLAP_SEC)
-                    overlap_audio = state.audio_accum[-overlap_samples:]
+            if not full_audio_chunks:
+                print("[WARN] No audio chunks received, skipping final processing.")
+                await ws.send_json({"message": "No audio chunks received, skipping final processing.", "meeting_id": meeting_id})
+                await ws.close()
+                return
+            wav16k = np.concatenate(full_audio_chunks)
+            duration = round(wav16k.shape[0] / 16000, 2)
 
-                    # ③ 새 세션 초기화 + 오버랩 재투입
-                    state = asr.init_streaming_state(
-                        language=language,
-                        unfixed_chunk_num=2,
-                        unfixed_token_num=5,
-                        chunk_size_sec=2.0,
-                    )
-                    asr.streaming_transcribe(overlap_audio, state)
-                    overlap_text_len = len(state.text or "")
+            # 전체 오디오는 원본으로 저장하고, 이후 전처리본으로 후처리를 진행한다.
+            STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+            audio_path = STORAGE_ROOT / f"meeting_{meeting_id}.wav"
+            preprocessed_audio_path = STORAGE_ROOT / f"meeting_{meeting_id}_preprocessed.wav"
+            sf.write(audio_path, wav16k, 16000)
+            print(f"[INFO] 원본 오디오 저장 완료: {audio_path}")
 
-                    # ── 확정 타임스탬프 정렬 (committed) ─────
-                    #   슬라이드로 텍스트가 확정되었으므로
-                    #   새로 확정된 오디오+텍스트를 정렬한다.
-                    #   확정 텍스트는 불변이므로 결과도 불변.
-                    committed_chunk_count = len(full_audio_chunks)
-                    new_chunks = full_audio_chunks[last_align_chunk_idx:committed_chunk_count]
-                    new_text = accumulated_text[last_align_text_len:].strip()
-                    if new_chunks and new_text:
-                        new_ts = align_chunk(
-                            new_chunks, new_text,
-                            state.language or language,
-                            last_align_time_offset,
-                        )
-                        committed_timestamps.extend(new_ts)
-                        chunk_samples = sum(c.shape[0] for c in new_chunks)
-                        last_align_time_offset += chunk_samples / 16000
-                        last_align_chunk_idx = committed_chunk_count
-                        last_align_text_len = len(accumulated_text)
-                    ts_dirty = True
-
-                    # ── 슬라이딩마다 화자분리 수행 (최근 10분 window) ──
-                    try:
-                        total_dur = total_received_samples / 16000
-
-                        if total_dur > DIARIZE_WINDOW_SEC:
-                            # 최근 10분에 해당하는 청크만 뒤에서부터 모아 concat
-                            win_samples = int(DIARIZE_WINDOW_SEC * 16000)
-                            selected_chunks = []
-                            collected = 0
-                            for chunk in reversed(full_audio_chunks):
-                                selected_chunks.append(chunk)
-                                collected += chunk.shape[0]
-                                if collected >= win_samples:
-                                    break
-                            selected_chunks.reverse()
-                            window_audio = np.concatenate(selected_chunks)[-win_samples:]
-                            time_offset = (total_received_samples - win_samples) / 16000
-
-                            new_segs, identity_map = run_diarization(
-                                window_audio, participants_embeddings, participants, speaker_registry
-                            )
-                            # 절대 시간으로 보정
-                            for seg in new_segs:
-                                seg["start"] = round(seg["start"] + time_offset, 3)
-                                seg["end"] = round(seg["end"] + time_offset, 3)
-
-                            # window 이전 세그먼트는 이전 결과 재사용
-                            old_segs = [s for s in diarization_segments if s["end"] <= time_offset]
-                            diarization_segments = old_segs + new_segs
-                        else:
-                            slide_audio = np.concatenate(full_audio_chunks)
-                            diarization_segments, identity_map = run_diarization(
-                                slide_audio, participants_embeddings, participants, speaker_registry
-                            )
-
-                        diarize_dirty = True
-                    except Exception as _exc:
-                        print(f"[ERROR] sliding diarization: {_exc}")
-
-                # ── 응답 전송 ─────────────────────────────────
-                current_session_text = state.text or ""
-                display_new = (
-                    current_session_text[overlap_text_len:]
-                    if len(current_session_text) > overlap_text_len
-                    else current_session_text
+            diarization_audio = wav16k
+            try:
+                processed_path, diarization_audio = preprocess_saved_audio(
+                    audio_path,
+                    preprocessed_audio_path,
                 )
-                # display_text = (accumulated_text + display_new).strip()
+                print(f"[INFO] 전처리 오디오 생성 완료: {processed_path}")
+            except Exception as exc:
+                print(f"[WARN] 오디오 전처리 실패, 원본으로 계속 진행합니다: {exc}")
 
-                response = {
-                    "language": state.language or language,
-                    "text": display_new.strip(),
-                    "final": False,
-                }
-                if ts_dirty:
-                    # all_ts = committed_timestamps
-                    # response["sentences"] = merge_to_sentences(all_ts)
-                    ts_dirty = False
-                if diarize_dirty and committed_timestamps and diarization_segments:
-                    _r = get_redis()
-                    # spk_id → user_id 맵핑 Redis 저장
-                    spk_user_map = {
-                        spk: str(idn.user_id)
-                        for spk, idn in identity_map.items()
-                        if idn.user_id is not None
-                    }
-                    if spk_user_map:
-                        await _r.hset(f"meeting:{meeting_id}:speakers", mapping=spk_user_map)
-                        await _r.expire(f"meeting:{meeting_id}:speakers", REDIS_TTL_SEC)
-                    speaker_words = assign_speakers(committed_timestamps, diarization_segments)
-                    utterances = merge_speaker_utterances(speaker_words)
-                    await _r.delete(f"meeting:{meeting_id}:utterances")
-                    for utt in utterances:
-                        ts = (meeting_start_time + timedelta(seconds=utt["start"])).strftime("%Y-%m-%dT%H:%M:%S")
-                        content = _clean_content(utt["text"])
-                        if not content:
-                            continue
-                        spk_id = utt["speaker"]
-                        idn = identity_map.get(spk_id) or SpeakerIdentity(
-                            user_id=None, display_name=spk_id, match_score=0.0, matched=False
-                        )
-                        await _r.rpush(f"meeting:{meeting_id}:utterances", json.dumps({
-                            "speaker_id": spk_id,
-                            "user_id": idn.user_id,
-                            "display_name": idn.display_name,
-                            "content": content,
-                            "timestamp": ts,
-                        }, ensure_ascii=False))
-                    await _r.expire(f"meeting:{meeting_id}:utterances", REDIS_TTL_SEC)
-                    raw_utts = await _r.lrange(f"meeting:{meeting_id}:utterances", 0, -1)
-                    diarization_resp = []
-                    for raw in raw_utts:
-                        item = json.loads(raw)
-                        item["speaker"] = item.get("display_name", item.get("speaker_id", "unknown"))
-                        diarization_resp.append(item)
-                    response["diarization"] = diarization_resp
-                    diarize_dirty = False
-                await ws.send_json(response)
-                await get_redis().set(f"meeting:{meeting_id}:latest", display_new.strip(), ex=REDIS_TTL_SEC)
-
-        except (WebSocketDisconnect, RuntimeError):
-            if asr:
-                asr.finish_streaming_transcribe(state)
-
-        # ── 최종 처리 ─────────────────────────────────────────
-        asr.finish_streaming_transcribe(state)
-
-        if not full_audio_chunks:
-            print("[WARN] No audio chunks received, skipping final processing.")
-            await ws.send_json({"message": "No audio chunks received, skipping final processing.", "meeting_id": meeting_id})
-            await ws.close()
-            return
-        wav16k = np.concatenate(full_audio_chunks)
-        duration = round(wav16k.shape[0] / 16000, 2)
-
-        # 전체 오디오는 원본으로 저장하고, 이후 전처리본으로 후처리를 진행한다.
-        STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
-        audio_path = STORAGE_ROOT / f"meeting_{meeting_id}.wav"
-        preprocessed_audio_path = STORAGE_ROOT / f"meeting_{meeting_id}_preprocessed.wav"
-        sf.write(audio_path, wav16k, 16000)
-        print(f"[INFO] 원본 오디오 저장 완료: {audio_path}")
-
-        diarization_audio = wav16k
-        try:
-            processed_path, diarization_audio = preprocess_saved_audio(
-                audio_path,
-                preprocessed_audio_path,
+            # 1) 화자분리 (CPU — GPU 점유 없음)
+            diarize_segments, offline_identity_map = offline_diarization(
+                diarization_audio, participants_embeddings, participants
             )
-            print(f"[INFO] 전처리 오디오 생성 완료: {processed_path}")
-        except Exception as exc:
-            print(f"[WARN] 오디오 전처리 실패, 원본으로 계속 진행합니다: {exc}")
 
-        # 1) 화자분리 (CPU — GPU 점유 없음)
-        diarize_segments, offline_identity_map = offline_diarization(
-            diarization_audio, participants_embeddings, participants
-        )
+            # 2) 화자 세그먼트별 ASR
+            segments_with_text = offline_asr_chunked(diarization_audio, diarize_segments)
 
-        # 2) 화자 세그먼트별 ASR
-        segments_with_text = offline_asr_chunked(diarization_audio, diarize_segments)
+            # 3) identity_map으로 speaker 정보 해소
+            for seg in segments_with_text:
+                spk_id = seg["speaker"]
+                idn = offline_identity_map.get(spk_id)
+                if idn:
+                    seg["speaker_id"] = idn.user_id
+                    seg["speaker"] = idn.display_name
+                else:
+                    seg["speaker_id"] = None
+                    seg["speaker"] = spk_id
 
-        # 3) identity_map으로 speaker 정보 해소
-        for seg in segments_with_text:
-            spk_id = seg["speaker"]
-            idn = offline_identity_map.get(spk_id)
-            if idn:
-                seg["speaker_id"] = idn.user_id
-                seg["speaker"] = idn.display_name
-            else:
-                seg["speaker_id"] = None
-                seg["speaker"] = spk_id
-
-        # 4) 세그먼트가 없으면 넘어가
-        if not segments_with_text:
-            print("No segments with text were generated, skipping MongoDB upload.")
-            await ws.send_json({"message": "Meeting processing complete", "meeting_id": meeting_id})
-            await ws.close()
-            return
+            # 4) 세그먼트가 없으면 넘어가
+            if not segments_with_text:
+                print("No segments with text were generated, skipping MongoDB upload.")
+                await ws.send_json({"message": "Meeting processing complete", "meeting_id": meeting_id})
+                await ws.close()
+                return
+        finally:
+            _release_streaming_state(locals().get("state"))
+            reset_asr_runtime_caches()
 
     minutes = build_minutes(segments_with_text, meeting_start_time)
 
@@ -420,35 +438,38 @@ async def test_endpoint(
     diarization_audio = wav16k
     duration = round(float(wav16k.shape[0]) / 16000.0, 3)
 
-    # 1) 화자분리 (CPU — GPU 점유 없음)
-    diarize_segments, offline_identity_map = offline_diarization(
-        diarization_audio, participants_embeddings, participants
-    )
+    try:
+        # 1) 화자분리 (CPU — GPU 점유 없음)
+        diarize_segments, offline_identity_map = offline_diarization(
+            diarization_audio, participants_embeddings, participants
+        )
 
-    # 2) 화자 세그먼트별 ASR
-    segments_with_text = offline_asr_chunked(diarization_audio, diarize_segments)
+        # 2) 화자 세그먼트별 ASR
+        segments_with_text = offline_asr_chunked(diarization_audio, diarize_segments)
 
-    # 3) identity_map으로 speaker 정보 해소
-    for seg in segments_with_text:
-        spk_id = seg["speaker"]
-        idn = offline_identity_map.get(spk_id)
-        if idn:
-            seg["speaker_id"] = idn.user_id
-            seg["speaker"] = idn.display_name
-        else:
-            seg["speaker_id"] = None
-            seg["speaker"] = spk_id
+        # 3) identity_map으로 speaker 정보 해소
+        for seg in segments_with_text:
+            spk_id = seg["speaker"]
+            idn = offline_identity_map.get(spk_id)
+            if idn:
+                seg["speaker_id"] = idn.user_id
+                seg["speaker"] = idn.display_name
+            else:
+                seg["speaker_id"] = None
+                seg["speaker"] = spk_id
 
-    # 4) 세그먼트가 없으면 넘어가
-    if not segments_with_text:
-        print("No segments with text were generated, skipping MongoDB upload.")
-        return {"message": "No segments with text were generated."}
+        # 4) 세그먼트가 없으면 넘어가
+        if not segments_with_text:
+            print("No segments with text were generated, skipping MongoDB upload.")
+            return {"message": "No segments with text were generated."}
 
-    minutes = build_minutes(segments_with_text, meeting_start_time)
+        minutes = build_minutes(segments_with_text, meeting_start_time)
 
-    # 몽고db에 저장
-    await upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
-    print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
+        # 몽고db에 저장
+        await upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
+        print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
 
-    return {"message": "Test processing complete", "meeting_id": meeting_id}
+        return {"message": "Test processing complete", "meeting_id": meeting_id}
+    finally:
+        reset_asr_runtime_caches()
 
