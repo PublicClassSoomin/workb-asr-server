@@ -306,15 +306,18 @@ def assign_speakers(
     word_timestamps: list[dict],
     diarization_segments: list[dict],
     margin: float = 0.0,
-    min_segment_duration: float = 1.0,
+    min_segment_duration: float = 0.3,
 ) -> list[dict]:
     """
     각 단어에 화자를 할당한다.
 
     midpoint 기준 대신 word-segment overlap duration을 계산하여
     가장 많이 겹치는 화자를 선택한다.
-    매칭 실패 시 직전 화자(fallback)를 사용하고,
-    직전 화자도 없으면 "unknown"으로 처리한다.
+    매칭 실패(gap 단어) 시 시간적으로 가장 가까운 세그먼트의 화자를 사용하고,
+    세그먼트가 전혀 없으면 "unknown"으로 처리한다.
+
+    min_segment_duration: 0.3 — 화자 교체 초기의 짧은 세그먼트도 포함하여
+      새 화자의 첫 단어가 이전 화자에 잘못 붙는 현상을 방지한다.
     """
     valid_segments = [
         seg for seg in diarization_segments
@@ -342,11 +345,29 @@ def assign_speakers(
         if best_spk is not None:
             last_speaker = best_spk
             result.append({**w, "speaker": best_spk, "overlap_ratio": overlap_ratio})
-        elif last_speaker is not None:
-            # fallback: 직전 화자
-            result.append({**w, "speaker": last_speaker, "overlap_ratio": 0.0})
         else:
-            result.append({**w, "speaker": "unknown", "overlap_ratio": 0.0})
+            # gap 단어: 시간적으로 가장 가까운 세그먼트의 화자에게 배정
+            # (직전 화자 고정 대신 앞/뒤 세그먼트를 모두 고려하여 화자 교체 경계를 정확히 처리)
+            nearest_spk: Optional[str] = None
+            nearest_dist = float("inf")
+            for seg in valid_segments:
+                if seg["end"] <= w["start"]:
+                    dist = w["start"] - seg["end"]
+                elif seg["start"] >= w["end"]:
+                    dist = seg["start"] - w["end"]
+                else:
+                    dist = 0.0
+                if dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest_spk = seg["speaker"]
+
+            if nearest_spk is not None:
+                last_speaker = nearest_spk
+                result.append({**w, "speaker": nearest_spk, "overlap_ratio": 0.0})
+            elif last_speaker is not None:
+                result.append({**w, "speaker": last_speaker, "overlap_ratio": 0.0})
+            else:
+                result.append({**w, "speaker": "unknown", "overlap_ratio": 0.0})
 
     return result
 
