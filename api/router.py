@@ -158,10 +158,18 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
                         break
 
                     # ── 오디오 전처리 및 스트리밍 추론 ───────────
-                    wav16k = bytes_to_wav16k(data)
+                    try:
+                        wav16k = bytes_to_wav16k(data)
+                    except Exception as exc:
+                        print(f"[WARN] 오디오 청크 변환 실패, 스킵합니다: {exc}")
+                        continue
                     full_audio_chunks.append(wav16k)
                     total_received_samples += wav16k.shape[0]
-                    asr.streaming_transcribe(wav16k, state)
+                    try:
+                        asr.streaming_transcribe(wav16k, state)
+                    except Exception as exc:
+                        print(f"[WARN] ASR 스트리밍 추론 실패, 스킵합니다: {exc}")
+                        continue
 
                     # ── 슬라이딩 윈도우 처리 ──────────────────────
                     if state.audio_accum.shape[0] >= max_samples:
@@ -265,48 +273,54 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
                         # response["sentences"] = merge_to_sentences(all_ts)
                         ts_dirty = False
                     if diarize_dirty and committed_timestamps and diarization_segments:
-                        _r = get_redis()
-                        # spk_id → user_id 맵핑 Redis 저장
-                        spk_user_map = {
-                            spk: str(idn.user_id)
-                            for spk, idn in identity_map.items()
-                            if idn.user_id is not None
-                        }
-                        if spk_user_map:
-                            await _r.hset(f"meeting:{meeting_id}:speakers", mapping=spk_user_map)
-                            await _r.expire(f"meeting:{meeting_id}:speakers", REDIS_TTL_SEC)
-                        speaker_words = assign_speakers(committed_timestamps, diarization_segments)
-                        utterances = merge_speaker_utterances(speaker_words)
-                        await _r.delete(f"meeting:{meeting_id}:utterances")
-                        for utt in utterances:
-                            ts = (meeting_start_time + timedelta(seconds=utt["start"])).strftime("%Y-%m-%dT%H:%M:%S")
-                            content = _clean_content(utt["text"])
-                            if not content:
-                                continue
-                            spk_id = utt["speaker"]
-                            idn = identity_map.get(spk_id) or SpeakerIdentity(
-                                user_id=None, display_name=spk_id, match_score=0.0, matched=False
-                            )
-                            await _r.rpush(f"meeting:{meeting_id}:utterances", json.dumps({
-                                "speaker_id": spk_id,
-                                "user_id": idn.user_id,
-                                "display_name": idn.display_name,
-                                "content": content,
-                                "timestamp": ts,
-                            }, ensure_ascii=False))
-                        await _r.expire(f"meeting:{meeting_id}:utterances", REDIS_TTL_SEC)
-                        raw_utts = await _r.lrange(f"meeting:{meeting_id}:utterances", 0, -1)
-                        diarization_resp = []
-                        for raw in raw_utts:
-                            item = json.loads(raw)
-                            item["speaker"] = item.get("display_name", item.get("speaker_id", "unknown"))
-                            diarization_resp.append(item)
-                        response["diarization"] = diarization_resp
-                        diarize_dirty = False
+                        try:
+                            _r = get_redis()
+                            # spk_id → user_id 맵핑 Redis 저장
+                            spk_user_map = {
+                                spk: str(idn.user_id)
+                                for spk, idn in identity_map.items()
+                                if idn.user_id is not None
+                            }
+                            if spk_user_map:
+                                await _r.hset(f"meeting:{meeting_id}:speakers", mapping=spk_user_map)
+                                await _r.expire(f"meeting:{meeting_id}:speakers", REDIS_TTL_SEC)
+                            speaker_words = assign_speakers(committed_timestamps, diarization_segments)
+                            utterances = merge_speaker_utterances(speaker_words)
+                            await _r.delete(f"meeting:{meeting_id}:utterances")
+                            for utt in utterances:
+                                ts = (meeting_start_time + timedelta(seconds=utt["start"])).strftime("%Y-%m-%dT%H:%M:%S")
+                                content = _clean_content(utt["text"])
+                                if not content:
+                                    continue
+                                spk_id = utt["speaker"]
+                                idn = identity_map.get(spk_id) or SpeakerIdentity(
+                                    user_id=None, display_name=spk_id, match_score=0.0, matched=False
+                                )
+                                await _r.rpush(f"meeting:{meeting_id}:utterances", json.dumps({
+                                    "speaker_id": spk_id,
+                                    "user_id": idn.user_id,
+                                    "display_name": idn.display_name,
+                                    "content": content,
+                                    "timestamp": ts,
+                                }, ensure_ascii=False))
+                            await _r.expire(f"meeting:{meeting_id}:utterances", REDIS_TTL_SEC)
+                            raw_utts = await _r.lrange(f"meeting:{meeting_id}:utterances", 0, -1)
+                            diarization_resp = []
+                            for raw in raw_utts:
+                                item = json.loads(raw)
+                                item["speaker"] = item.get("display_name", item.get("speaker_id", "unknown"))
+                                diarization_resp.append(item)
+                            response["diarization"] = diarization_resp
+                            diarize_dirty = False
+                        except Exception as _exc:
+                            print(f"[ERROR] Redis 화자분리 저장 실패: {_exc}")
+                            diarize_dirty = False
                     await ws.send_json(response)
                     await get_redis().set(f"meeting:{meeting_id}:latest", display_new.strip(), ex=REDIS_TTL_SEC)
 
-            except (WebSocketDisconnect, RuntimeError):
+            except (WebSocketDisconnect, RuntimeError, ConnectionResetError, OSError) as exc:
+                if not isinstance(exc, WebSocketDisconnect):
+                    print(f"[WARN] 스트리밍 중 연결 오류: {type(exc).__name__}: {exc}")
                 if asr:
                     asr.finish_streaming_transcribe(state)
 
@@ -339,27 +353,33 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
                 print(f"[WARN] 오디오 전처리 실패, 원본으로 계속 진행합니다: {exc}")
 
             # 1) 화자분리 (CPU — GPU 점유 없음)
-            diarize_segments, offline_identity_map = offline_diarization(
-                diarization_audio, participants_embeddings, participants
-            )
+            try:
+                diarize_segments, offline_identity_map = offline_diarization(
+                    diarization_audio, participants_embeddings, participants
+                )
 
-            # 2) 화자 세그먼트별 ASR
-            segments_with_text = offline_asr_chunked(diarization_audio, diarize_segments)
+                # 2) 화자 세그먼트별 ASR
+                segments_with_text = offline_asr_chunked(diarization_audio, diarize_segments)
 
-            # 3) identity_map으로 speaker 정보 해소
-            for seg in segments_with_text:
-                spk_id = seg["speaker"]
-                idn = offline_identity_map.get(spk_id)
-                if idn:
-                    seg["speaker_id"] = idn.user_id
-                    seg["speaker"] = idn.display_name
-                else:
-                    seg["speaker_id"] = None
-                    seg["speaker"] = spk_id
+                # 3) identity_map으로 speaker 정보 해소
+                for seg in segments_with_text:
+                    spk_id = seg["speaker"]
+                    idn = offline_identity_map.get(spk_id)
+                    if idn:
+                        seg["speaker_id"] = idn.user_id
+                        seg["speaker"] = idn.display_name
+                    else:
+                        seg["speaker_id"] = None
+                        seg["speaker"] = spk_id
 
-            # 4) 세그먼트가 없으면 넘어가
-            if not segments_with_text:
-                print("No segments with text were generated, skipping MongoDB upload.")
+                # 4) 세그먼트가 없으면 넘어가
+                if not segments_with_text:
+                    print("No segments with text were generated, skipping MongoDB upload.")
+                    await ws.send_json({"message": "Meeting processing complete", "meeting_id": meeting_id})
+                    await ws.close()
+                    return
+            except Exception as exc:
+                print(f"[ERROR] 오프라인 후처리 실패 (묵음 또는 오디오 오류): {exc}")
                 await ws.send_json({"message": "Meeting processing complete", "meeting_id": meeting_id})
                 await ws.close()
                 return
@@ -370,11 +390,17 @@ async def ws_meeting(ws: WebSocket, meeting_id: str):
     minutes = build_minutes(segments_with_text, meeting_start_time)
 
     # 몽고db에 저장
-    await upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
-    print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
+    try:
+        await upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
+        print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
+    except Exception as exc:
+        print(f"[ERROR] MongoDB 저장 실패: {exc}")
 
-    await ws.send_json({"message": "Meeting processing complete", "meeting_id": meeting_id})
-    await ws.close()
+    try:
+        await ws.send_json({"message": "Meeting processing complete", "meeting_id": meeting_id})
+        await ws.close()
+    except Exception:
+        pass
 
 @router.post("/embedding/{user_id}")
 async def update_embedding(user_id: int, audio: UploadFile = File(...)):
@@ -391,14 +417,22 @@ async def update_embedding(user_id: int, audio: UploadFile = File(...)):
     embedding = pyannote_pipeline._embedding
     # (batch=1, channel=1, samples) 형태의 torch tensor로 변환
     waveform = torch.from_numpy(wav16k).unsqueeze(0).unsqueeze(0)  # (1, 1, N)
-    emb = embedding(waveform)
+    try:
+        emb = embedding(waveform)
+    except Exception as exc:
+        print(f"[ERROR] 임베딩 추론 실패: {exc}")
+        raise HTTPException(status_code=500, detail="임베딩 추출 중 오류가 발생했습니다.")
     emb_np = emb.squeeze(0) if hasattr(emb, "squeeze") else emb
     print(emb_np, emb_np.shape)
     emb_str = str(emb_np.tolist())
     print(emb_str)
     # DB에 저장
     # 기존에 있던 임베딩은 덮어쓰기
-    await save_user_embedding(user_id, emb_str)
+    try:
+        await save_user_embedding(user_id, emb_str)
+    except Exception as exc:
+        print(f"[ERROR] 임베딩 DB 저장 실패: {exc}")
+        raise HTTPException(status_code=500, detail="임베딩 저장 중 오류가 발생했습니다.")
     return {"message": f"성공적으로 저장되었습니다."}
 
 @router.post("/test")
@@ -433,12 +467,12 @@ async def test_endpoint(
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
     audio_path = STORAGE_ROOT / f"meeting_{meeting_id}.wav"
 
-    sf.write(audio_path, wav16k, 16000)
-
     diarization_audio = wav16k
     duration = round(float(wav16k.shape[0]) / 16000.0, 3)
 
     try:
+        sf.write(audio_path, wav16k, 16000)
+
         # 1) 화자분리 (CPU — GPU 점유 없음)
         diarize_segments, offline_identity_map = offline_diarization(
             diarization_audio, participants_embeddings, participants
@@ -466,10 +500,19 @@ async def test_endpoint(
         minutes = build_minutes(segments_with_text, meeting_start_time)
 
         # 몽고db에 저장
-        await upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
-        print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
+        try:
+            await upload_mongodb(minutes, meeting_id, workspace_id, duration, meeting_start_time)
+            print(f"Meeting {meeting_id} processed and uploaded to MongoDB with duration {duration} seconds.")
+        except Exception as exc:
+            print(f"[ERROR] MongoDB 저장 실패: {exc}")
+            raise HTTPException(status_code=500, detail="MongoDB 저장 중 오류가 발생했습니다.")
 
         return {"message": "Test processing complete", "meeting_id": meeting_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[ERROR] 테스트 처리 실패 (묵음 또는 오디오 오류): {exc}")
+        raise HTTPException(status_code=500, detail=f"오디오 처리 중 오류가 발생했습니다: {exc}")
     finally:
         reset_asr_runtime_caches()
 
